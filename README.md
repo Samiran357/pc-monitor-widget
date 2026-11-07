@@ -2,8 +2,8 @@
 
 A small, always-visible desktop widget for Windows 10/11 that shows live system stats: CPU, RAM, temperature, the apps using the most memory, and more. It is draggable, semi-transparent, and uses very little CPU itself.
 
-
-![Screenshot](docs/Screenshot 2026-11-06 194916.png)
+<!-- Add a screenshot here after you upload it to the repo:
+![Screenshot](docs/screenshot.png)
 -->
 
 ## Features
@@ -20,26 +20,34 @@ A small, always-visible desktop widget for Windows 10/11 that shows live system 
 - Remembers its position and settings
 - Only one copy can run at a time
 
-## Quick start (no Python needed)
+## Quick start (one file, nothing else to install)
 
 1. Go to the **Releases** page of this repository.
 2. Download `PCMonitorWidget.exe`.
-3. Double-click it. The widget appears on your desktop.
-4. Right-click the widget and tick **Start with Windows** if you want it to open automatically at sign-in.
+3. Double-click it and click **Yes** on the Windows permission prompt (see [Why administrator?](#why-administrator)).
+4. The widget appears. On first run it sets up the temperature sensors by itself, which takes a few seconds, so "Temp" may say `waiting for sensors...` briefly.
+5. Right-click the widget and tick **Start with Windows** if you want it to open automatically at sign-in (no permission prompt after that).
+
+That's it. Python, LibreHardwareMonitor and the sensor driver are all included inside the exe.
+
+### Why administrator?
+
+Windows only lets programs with administrator rights read hardware temperatures. The widget asks once when it opens. If you click **No**, it still works but shows `Temp: N/A`.
 
 > **Windows SmartScreen or antivirus warning?** Programs built with PyInstaller are sometimes flagged because they are new and unsigned. The full source is in this repository, and you can build the exe yourself (see [Build the exe yourself](#build-the-exe-yourself)) if you prefer.
 
-## Showing temperature
+## How temperature works
 
-Windows does not let normal programs read hardware temperature, so the widget needs a helper:
+The exe bundles two free, open-source helpers and manages them for you:
 
-1. Download **LibreHardwareMonitor** (free, open source) from its GitHub releases page.
-2. Run it **as Administrator** (right-click, Run as administrator).
-3. Leave it running, minimized. Optionally set it to start with Windows in its Options menu.
+- **LibreHardwareMonitor** reads the sensors. The widget starts it hidden in the tray and closes it when you close the widget.
+- **PawnIO** is a small driver that lets it read CPU sensors. It is installed silently the first time you run the widget (it needs the administrator permission you already gave).
 
-The widget then picks up CPU and GPU temperature automatically and the corner note shows `LibreHardwareMonitor`.
+Nothing to download or start by hand. If you ever see `Temp: N/A`:
 
-Without it, the widget tries a built-in Windows sensor (ACPI thermal zone). That only works on some PCs and usually needs Administrator rights. If neither works, the widget shows `Temp: N/A` and everything else keeps working.
+- Check the small note next to it: `waiting for sensors...` just means give it a few seconds; `run as administrator` means the permission prompt was declined (close and reopen the widget, click Yes).
+- A few PCs (some laptops, virtual machines) simply don't expose a temperature sensor. Everything else in the widget still works.
+- Some antivirus programs dislike hardware-monitoring drivers. If yours blocks it, allow the widget in your antivirus.
 
 ## Controls
 
@@ -57,7 +65,7 @@ Settings are saved to `.pc_widget.json` in your user folder (`C:\Users\<you>\`).
 
 ## Run from source
 
-Requires Windows and Python 3.9 or newer.
+Requires Windows and Python 3.9 or newer. Running from source does not include the sensor helpers: open PowerShell in the project folder and run `./get_vendor.ps1` once (needs the [GitHub CLI](https://cli.github.com), signed in with `gh auth login`). It fills a `vendor` folder that the widget picks up automatically. Skip this step if you only want CPU/RAM/disk/network and don't need temperature.
 
 1. Install Python from python.org. On the first installer screen, tick **Add Python to PATH**.
 2. Download or clone this repository.
@@ -82,9 +90,9 @@ Do not type these commands inside the Python prompt (the one that shows `>>>`). 
 
 ### Option A: on your PC
 
-1. Install Python (see above).
-2. Double-click `build.bat`, or run it from Command Prompt.
-3. The result is `dist\PCMonitorWidget.exe`.
+1. Install Python (see above) and the [GitHub CLI](https://cli.github.com), then run `gh auth login` once.
+2. Double-click `build.bat`, or run it from Command Prompt. It downloads the sensor helpers, then builds.
+3. The result is `dist\PCMonitorWidget.exe`, with everything bundled inside.
 
 ### Option B: automatically on GitHub (for maintainers)
 
@@ -122,7 +130,9 @@ Before publishing, open `LICENSE` and replace `Your Name` with your name, and ad
 
 ## Troubleshooting
 
-**Temp: N/A** — Start LibreHardwareMonitor as Administrator and leave it running. See [Showing temperature](#showing-temperature).
+**Temp: N/A** — See [How temperature works](#how-temperature-works). Most often: click Yes on the permission prompt and wait a few seconds after the first start.
+
+**GitHub build fails at "Download sensor helpers"** — The release file names of LibreHardwareMonitor or PawnIO may have changed. Open the failed step's log: it prints the available file names. Adjust the names in `get_vendor.ps1`.
 
 **Nothing happens when I run it** — Run `python pc_widget.py` from Command Prompt (not `pythonw`) to see any error message.
 
@@ -146,6 +156,8 @@ pc-monitor-widget/
 ├── requirements.txt          Python packages
 ├── start_widget.vbs          Launcher with no console window
 ├── build.bat                 Builds the exe locally
+├── get_vendor.ps1            Downloads LibreHardwareMonitor + PawnIO for bundling
+├── THIRD_PARTY.md            Licenses of the bundled helpers
 ├── .github/workflows/build.yml   Builds and releases the exe on GitHub
 ├── LICENSE
 └── README.md

@@ -90,40 +90,167 @@ def pct_color(p):
 
 # ---------------------------------------------------------------- start with Windows
 APP_NAME = "PCMonitorWidget"
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+
+DATA_DIR = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), APP_NAME)
+LHM_DIR = os.path.join(DATA_DIR, "LibreHardwareMonitor")
+LHM_EXE = os.path.join(LHM_DIR, "LibreHardwareMonitor.exe")
+LHM_PROC = "LibreHardwareMonitor.exe"
+
+LHM_CONFIG = """<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <appSettings>
+    <add key="startMinMenuItem" value="true" />
+    <add key="minTrayMenuItem" value="true" />
+    <add key="minCloseMenuItem" value="true" />
+  </appSettings>
+</configuration>
+"""
 
 
-def _launch_command():
-    """Command Windows should run at sign-in (works for both .exe and .py)."""
+def resource_path(*parts):
+    """Path to a file bundled inside the exe (or next to the script)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
+
+
+def _run_hidden(args, timeout=60):
+    import subprocess
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                          creationflags=NO_WINDOW)
+
+
+# ---- administrator rights (needed to read hardware sensors)
+def is_admin():
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """Ask Windows for administrator rights (one UAC prompt) and restart."""
+    try:
+        import ctypes
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, ""
+        else:
+            exe = sys.executable
+            params = f'"{os.path.abspath(__file__)}"'
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return rc > 32  # > 32 means the elevated copy was started
+    except Exception:
+        return False
+
+
+# ---- start with Windows (scheduled task, so it can start elevated without a prompt)
+def _launch_parts():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return sys.executable, ""
     exe = sys.executable
     pyw = os.path.join(os.path.dirname(exe), "pythonw.exe")
     if os.path.exists(pyw):
         exe = pyw
-    return f'"{exe}" "{os.path.abspath(__file__)}"'
+    return exe, f'"{os.path.abspath(__file__)}"'
+
+
+def _ps_quote(s):
+    return "'" + s.replace("'", "''") + "'"
 
 
 def autostart_enabled():
     try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            winreg.QueryValueEx(k, APP_NAME)
-            return True
+        return _run_hidden(["schtasks", "/Query", "/TN", APP_NAME], timeout=10).returncode == 0
     except Exception:
         return False
 
 
 def set_autostart(enable):
-    import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-        if enable:
-            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, _launch_command())
-        else:
-            try:
-                winreg.DeleteValue(k, APP_NAME)
-            except FileNotFoundError:
-                pass
+    if enable:
+        exe, args = _launch_parts()
+        arg_part = f"-Argument {_ps_quote(args)}" if args else ""
+        script = (
+            f"$a = New-ScheduledTaskAction -Execute {_ps_quote(exe)} {arg_part}; "
+            "$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME; "
+            "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
+            "-DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); "
+            "$p = New-ScheduledTaskPrincipal -UserId $env:USERNAME "
+            "-LogonType Interactive -RunLevel Highest; "
+            f"Register-ScheduledTask -TaskName {_ps_quote(APP_NAME)} -Action $a "
+            "-Trigger $t -Settings $s -Principal $p -Force | Out-Null"
+        )
+    else:
+        script = (f"Unregister-ScheduledTask -TaskName {_ps_quote(APP_NAME)} "
+                  "-Confirm:$false -ErrorAction SilentlyContinue")
+    r = _run_hidden(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-Command", script], timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr or "could not change startup task")
+
+
+# ---- bundled sensor helper: PawnIO driver + LibreHardwareMonitor
+def pawnio_installed():
+    try:
+        return _run_hidden(["sc", "query", "PawnIO"], timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_pawnio(cfg):
+    """Install the PawnIO driver (used for CPU sensors) once, silently."""
+    if pawnio_installed() or cfg.get("pawnio_tried"):
+        return
+    setup = resource_path("vendor", "PawnIO_setup.exe")
+    if not os.path.exists(setup):
+        return
+    cfg["pawnio_tried"] = True  # never loop on failure
+    save_config(cfg)
+    try:
+        _run_hidden([setup, "-install", "-silent"], timeout=120)
+    except Exception:
+        pass
+
+
+def ensure_lhm_files():
+    """Copy the bundled LibreHardwareMonitor to a permanent folder (once)."""
+    src = resource_path("vendor", "LibreHardwareMonitor")
+    if not os.path.isdir(src):
+        return os.path.exists(LHM_EXE)
+    import shutil
+    if not os.path.exists(LHM_EXE):
+        shutil.copytree(src, LHM_DIR, dirs_exist_ok=True)
+    cfg_file = os.path.join(LHM_DIR, "LibreHardwareMonitor.config")
+    try:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            f.write(LHM_CONFIG)
+    except Exception:
+        pass
+    return os.path.exists(LHM_EXE)
+
+
+def lhm_running():
+    for p in psutil.process_iter(["name"]):
+        try:
+            if (p.info["name"] or "").lower() == LHM_PROC.lower():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def start_lhm():
+    """Start LibreHardwareMonitor hidden in the tray. Returns the process or None."""
+    import subprocess
+    if lhm_running() or not ensure_lhm_files():
+        return None
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 7  # SW_SHOWMINNOACTIVE
+    try:
+        return subprocess.Popen([LHM_EXE], cwd=LHM_DIR, startupinfo=si)
+    except Exception:
+        return None
 
 
 _mutex_handle = None
@@ -144,16 +271,36 @@ def already_running():
 class SlowData:
     """Temperature + top-process scan run in a thread so the UI never freezes."""
 
-    def __init__(self):
+    def __init__(self, cfg):
+        self.cfg = cfg
         self.cpu_temp = None
         self.gpu_temp = None
         self.temp_source = ""
+        self.status = "starting sensors..."
         self.top_apps = []  # [(name, bytes, count)]
+        self.lhm_proc = None
         self._stop = False
         threading.Thread(target=self._loop, daemon=True).start()
 
     def stop(self):
         self._stop = True
+        # close the sensor helper only if this widget started it
+        if self.lhm_proc is not None:
+            try:
+                self.lhm_proc.terminate()
+            except Exception:
+                pass
+
+    def _setup_sensors(self):
+        try:
+            if is_admin():
+                ensure_pawnio(self.cfg)
+                self.lhm_proc = start_lhm()
+                self.status = "waiting for sensors..."
+            else:
+                self.status = "run as administrator"
+        except Exception:
+            self.status = "sensor setup failed"
 
     def _loop(self):
         try:
@@ -161,6 +308,7 @@ class SlowData:
             pythoncom.CoInitialize()
         except Exception:
             pass
+        self._setup_sensors()
         while not self._stop:
             try:
                 self._read_temps()
@@ -244,7 +392,7 @@ class Widget:
         self.root.attributes("-topmost", self.cfg["topmost"])
         self.root.geometry(f"{WIDTH}x10+{self.cfg['x']}+{self.cfg['y']}")
 
-        self.slow = SlowData()
+        self.slow = SlowData(self.cfg)
         self.last_net = psutil.net_io_counters()
         self.last_net_t = time.time()
         psutil.cpu_percent(None)
@@ -422,7 +570,7 @@ class Widget:
             self.temp_note.config(text=self.slow.temp_source)
         else:
             self.temp_cpu.config(text="Temp: N/A", fg=MUTED)
-            self.temp_note.config(text="start LibreHardwareMonitor")
+            self.temp_note.config(text=self.slow.status)
         if gt is not None:
             self.temp_gpu.config(text=f"GPU {gt:.0f}°C", fg=temp_color(gt))
         else:
@@ -474,6 +622,10 @@ class Widget:
 
 
 if __name__ == "__main__":
+    # Hardware sensors need administrator rights: ask once (UAC) and restart.
+    if os.name == "nt" and not is_admin():
+        if relaunch_as_admin():
+            sys.exit(0)
     if already_running():
         sys.exit(0)
     Widget().run()
