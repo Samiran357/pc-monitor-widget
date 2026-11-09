@@ -2,16 +2,14 @@
 
 A small, always-visible desktop widget for Windows 10/11 that shows live system stats: CPU, RAM, temperature, the apps using the most memory, and more. It is draggable, semi-transparent, and uses very little CPU itself.
 
-
-![Screenshot](docs/Screenshot 2026-11-06 194916.png)
--->
+![Screenshot](docs/screenshot.png)
 
 ## Features
 
 - Clock and date
 - CPU usage and RAM usage, with colour bars (green, yellow, red) and used/free memory
 - CPU and GPU temperature
-- Top 3 apps by RAM (all processes of one app are added together, e.g. `chrome x24`)
+- Top 3 apps by RAM (all processes of one app are added together, e.g. `chrome x24`), using the same memory figure as Task Manager
 - Disk usage of the system drive
 - Live download and upload speed
 - Battery level and time left (or "plugged in" on desktops)
@@ -31,15 +29,19 @@ A small, always-visible desktop widget for Windows 10/11 that shows live system 
 
 ## Showing temperature
 
-Windows does not let normal programs read hardware temperature, so the widget needs a helper:
+The widget reads temperature from the first of these that works. The small note in the corner of the temperature card tells you which one it is using:
+
+1. **LibreHardwareMonitor** (or OpenHardwareMonitor), if it is running. The most accurate option: real CPU and GPU sensors.
+2. **Windows' ACPI thermal zone** (note shows `ACPI`). Needs no helper and no Administrator rights. Most laptops have one and it follows the CPU closely; some desktops have none, or it reports a motherboard sensor instead.
+3. **The NVIDIA driver** (note shows `NVIDIA`) for the GPU temperature, on PCs with an NVIDIA graphics card.
+
+If none of them works, the card shows `Temp: N/A` and everything else keeps working.
+
+For the most accurate numbers, use LibreHardwareMonitor:
 
 1. Download **LibreHardwareMonitor** (free, open source) from its GitHub releases page.
 2. Run it **as Administrator** (right-click, Run as administrator).
 3. Leave it running, minimized. Optionally set it to start with Windows in its Options menu.
-
-The widget then picks up CPU and GPU temperature automatically and the corner note shows `LibreHardwareMonitor`.
-
-Without it, the widget tries a built-in Windows sensor (ACPI thermal zone). That only works on some PCs and usually needs Administrator rights. If neither works, the widget shows `Temp: N/A` and everything else keeps working.
 
 ## Controls
 
@@ -52,6 +54,7 @@ Without it, the widget tries a built-in Windows sensor (ACPI thermal zone). That
 | Change transparency | Menu, Opacity |
 | Start with Windows | Menu, Start with Windows |
 | Close | Menu, Close widget |
+| See which version you have | Right-click: the first line of the menu shows it |
 
 Settings are saved to `.pc_widget.json` in your user folder (`C:\Users\<you>\`). Delete that file to reset them.
 
@@ -122,9 +125,11 @@ Before publishing, open `LICENSE` and replace `Your Name` with your name, and ad
 
 ## Troubleshooting
 
-**Temp: N/A** — Start LibreHardwareMonitor as Administrator and leave it running. See [Showing temperature](#showing-temperature).
+**Temp: N/A** — Your PC exposes no thermal zone to Windows and has no NVIDIA GPU. Start LibreHardwareMonitor as Administrator and leave it running. See [Showing temperature](#showing-temperature).
 
 **Nothing happens when I run it** — Run `python pc_widget.py` from Command Prompt (not `pythonw`) to see any error message.
+
+**Windows says "An Application Control policy has blocked this file"** — Smart App Control (Windows 11) blocks programs that are not signed by a known publisher, and this exe is not signed. Run the widget from source instead (see [Run from source](#run-from-source)); Python itself is signed, so it is allowed. Smart App Control can be turned off in Windows Security, but it cannot be turned on again without reinstalling Windows.
 
 **`pip` is not recognized** — Use `py -m pip ...`, or add Python to PATH by rerunning the Python installer, choosing Modify, and ticking "Add Python to environment variables".
 
@@ -136,7 +141,7 @@ Before publishing, open `LICENSE` and replace `Your Name` with your name, and ad
 
 **How do I stop it from starting with Windows?** — Right-click the widget and untick Start with Windows. You can also check Task Manager, Startup tab.
 
-**It shows only one monitor's worth of position after I unplug a screen** — Delete `.pc_widget.json` in your user folder to reset its position.
+**The widget disappeared after I unplugged a screen** — Start it again (end `PCMonitorWidget` in Task Manager first if it is still running). If its saved position is no longer on any screen, it moves back to the top-left of the main screen.
 
 ## Project layout
 
@@ -147,6 +152,7 @@ pc-monitor-widget/
 ├── start_widget.vbs          Launcher with no console window
 ├── build.bat                 Builds the exe locally
 ├── .github/workflows/build.yml   Builds and releases the exe on GitHub
+├── docs/screenshot.png       Screenshot used in this file
 ├── LICENSE
 └── README.md
 ```

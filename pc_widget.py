@@ -5,15 +5,20 @@ and the apps using the most RAM. Draggable, frameless, always on your desktop.
 
 Run:  python pc_widget.py
 """
+import ctypes
 import json
 import os
 import sys
 import threading
 import time
 import tkinter as tk
+import traceback
+from ctypes import wintypes
 from datetime import datetime
 
 import psutil
+
+__version__ = "1.1.0"
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pc_widget.json")
 
@@ -35,9 +40,15 @@ def load_config():
     cfg = {"x": 40, "y": 40, "topmost": False, "alpha": 0.93, "locked": False}
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg.update(json.load(f))
+            saved = json.load(f)
+        for key, default in list(cfg.items()):
+            try:
+                cfg[key] = type(default)(saved[key])
+            except Exception:
+                pass  # missing or damaged value: keep the default
+        cfg["alpha"] = min(1.0, max(0.2, cfg["alpha"]))  # 0 would make the widget invisible
     except Exception:
-        pass
+        pass  # no file yet, or not valid JSON: start with defaults
     return cfg
 
 
@@ -133,11 +144,85 @@ def already_running():
     """True if another copy of the widget is already open."""
     global _mutex_handle
     try:
-        import ctypes
-        _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, "PCMonitorWidgetMutex")
-        return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+        _mutex_handle = kernel32.CreateMutexW(None, False, "PCMonitorWidgetMutex")
+        return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------- display
+def enable_dpi_awareness():
+    """Stop Windows from stretching the window on scaled displays (125%, 150%...), which blurs the text."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass  # already set, or not available: the widget still works, just less sharp
+
+
+def on_screen(x, y):
+    """False if the point is on no monitor, e.g. a position saved on a screen that is now unplugged."""
+    try:
+        user32 = ctypes.WinDLL("user32")
+        user32.MonitorFromPoint.restype = wintypes.HMONITOR
+        user32.MonitorFromPoint.argtypes = (wintypes.POINT, wintypes.DWORD)
+        return bool(user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 0))
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------- process memory
+# psutil asks Windows about one process at a time, and for the many system processes a normal
+# user may not open it falls back to a full system scan *per process*. That cost about 0.8 s of
+# CPU every time the "top apps" list was refreshed. One NtQuerySystemInformation call returns
+# every process at once, and its "private working set" is the figure Task Manager shows.
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT),
+                ("Buffer", ctypes.c_void_p)]
+
+
+class _SYSTEM_PROCESS_INFORMATION(ctypes.Structure):
+    # Start of each record; the fields after ImageName are not needed here.
+    _fields_ = [("NextEntryOffset", wintypes.ULONG),
+                ("NumberOfThreads", wintypes.ULONG),
+                ("WorkingSetPrivateSize", ctypes.c_longlong),
+                ("HardFaultCount", wintypes.ULONG),
+                ("NumberOfThreadsHighWatermark", wintypes.ULONG),
+                ("CycleTime", ctypes.c_ulonglong),
+                ("CreateTime", ctypes.c_longlong),
+                ("UserTime", ctypes.c_longlong),
+                ("KernelTime", ctypes.c_longlong),
+                ("ImageName", _UNICODE_STRING)]
+
+
+def process_memory():
+    """[(name, private working set in bytes)] for every running process, from one system call."""
+    query = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+    query.restype = ctypes.c_ulong
+    query.argtypes = (ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong))
+    size = 0x80000
+    while True:
+        buf = ctypes.create_string_buffer(size)
+        needed = ctypes.c_ulong(0)
+        status = query(5, buf, size, ctypes.byref(needed))  # 5 = SystemProcessInformation
+        if status == 0:
+            break
+        if status != 0xC0000004:  # anything but STATUS_INFO_LENGTH_MISMATCH (buffer too small)
+            raise OSError(f"NtQuerySystemInformation failed: 0x{status:08X}")
+        size = max(size, needed.value) + 0x10000
+    result, offset = [], 0
+    while True:
+        p = _SYSTEM_PROCESS_INFORMATION.from_buffer(buf, offset)
+        if p.ImageName.Buffer:
+            name = ctypes.wstring_at(p.ImageName.Buffer, p.ImageName.Length // 2)
+        else:
+            name = "System Idle Process"
+        result.append((name, p.WorkingSetPrivateSize))
+        if not p.NextEntryOffset:
+            return result
+        offset += p.NextEntryOffset
 
 
 # ---------------------------------------------------------------- slow sensors (background thread)
@@ -149,6 +234,8 @@ class SlowData:
         self.gpu_temp = None
         self.temp_source = ""
         self.top_apps = []  # [(name, bytes, count)]
+        self._cimv2 = None  # WMI connection for the thermal zone, opened on first use
+        self._nvml = None  # (library, device handle) once opened; False if there is no NVIDIA driver
         self._stop = False
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -161,11 +248,16 @@ class SlowData:
             pythoncom.CoInitialize()
         except Exception:
             pass
+        next_temps = 0
         while not self._stop:
-            try:
-                self._read_temps()
-            except Exception:
-                pass
+            if time.time() >= next_temps:
+                try:
+                    self._read_temps()
+                except Exception:
+                    pass
+                # Temperatures move slowly: every 5 s is plenty. With no source at all, asking
+                # WMI every round is wasted work, so look again in 30 s.
+                next_temps = time.time() + (5 if self.temp_source else 30)
             try:
                 self._read_top_apps()
             except Exception:
@@ -173,57 +265,99 @@ class SlowData:
             time.sleep(2.5)
 
     def _read_temps(self):
+        cpu = gpu = None
+        source = ""
         try:
             import wmi
         except Exception:
-            return
+            wmi = None
 
-        # 1) LibreHardwareMonitor / OpenHardwareMonitor (accurate, must be running)
-        for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
-            try:
-                w = wmi.WMI(namespace=ns)
-                sensors = [s for s in w.Sensor() if s.SensorType == "Temperature"]
-                if not sensors:
+        # 1) LibreHardwareMonitor / OpenHardwareMonitor (most accurate, must be running)
+        if wmi:
+            for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
+                try:
+                    w = wmi.WMI(namespace=ns)
+                    # "Distance to TjMax" sensors are headroom, not a temperature: on a cool CPU
+                    # they are the largest value and would be shown as the CPU temperature.
+                    sensors = [s for s in w.Sensor() if s.SensorType == "Temperature"
+                               and "tjmax" not in s.Name.lower()]
+                    if not sensors:
+                        continue
+                    cpus = [s.Value for s in sensors
+                            if any(k in s.Name.lower() for k in ("cpu package", "package", "cpu core", "core (tctl", "tctl"))]
+                    if not cpus:
+                        cpus = [s.Value for s in sensors if "cpu" in s.Name.lower()]
+                    gpus = [s.Value for s in sensors if "gpu" in s.Name.lower()]
+                    # "GPU Core" is the figure other tools show; "GPU Hot Spot" runs 10-15 degrees hotter
+                    gpu_core = [s.Value for s in sensors if "gpu core" in s.Name.lower()]
+                    cpu = max(cpus) if cpus else None
+                    gpu = max(gpu_core or gpus) if gpus else None
+                    source = ns.split("\\")[-1]
+                    break
+                except Exception:
                     continue
-                cpu = [s.Value for s in sensors
-                       if any(k in s.Name.lower() for k in ("cpu package", "package", "cpu core", "core (tctl", "tctl"))]
-                if not cpu:
-                    cpu = [s.Value for s in sensors if "cpu" in s.Name.lower()]
-                gpu = [s.Value for s in sensors if "gpu" in s.Name.lower()]
-                self.cpu_temp = max(cpu) if cpu else None
-                self.gpu_temp = max(gpu) if gpu else None
-                self.temp_source = ns.split("\\")[-1]
-                return
-            except Exception:
-                continue
 
-        # 2) ACPI thermal zone (works on some PCs, may need Administrator)
+        # 2) ACPI thermal zone through its performance counter: works for normal users on many
+        #    laptops (the root\wmi class needs Administrator). Some desktops have no zone.
+        if cpu is None and wmi:
+            cpu = self._thermal_zone_temp(wmi)
+            if cpu is not None:
+                source = "ACPI"
+
+        # 3) GPU temperature straight from the NVIDIA driver (no NVIDIA GPU: stays empty)
+        if gpu is None:
+            gpu = self._nvidia_temp()
+            if gpu is not None:
+                source = "ACPI · NVIDIA" if source == "ACPI" else (source or "NVIDIA")
+
+        self.cpu_temp, self.gpu_temp, self.temp_source = cpu, gpu, source
+
+    def _thermal_zone_temp(self, wmi_module):
+        """Hottest ACPI thermal zone in °C, or None if Windows reports none."""
         try:
-            w = wmi.WMI(namespace="root\\wmi")
-            zones = w.MSAcpi_ThermalZoneTemperature()
-            vals = [(z.CurrentTemperature / 10.0) - 273.15 for z in zones]
+            if self._cimv2 is None:
+                self._cimv2 = wmi_module.WMI()  # kept open: connecting costs more than the query
+            vals = []
+            for z in self._cimv2.Win32_PerfRawData_Counters_ThermalZoneInformation():
+                kelvin = z.HighPrecisionTemperature / 10.0 if z.HighPrecisionTemperature else float(z.Temperature)
+                vals.append(kelvin - 273.15)
             vals = [v for v in vals if 0 < v < 130]
-            if vals:
-                self.cpu_temp = max(vals)
-                self.gpu_temp = None
-                self.temp_source = "ACPI"
-                return
+            return max(vals) if vals else None
         except Exception:
-            pass
+            self._cimv2 = None  # connect again next time
+            return None
 
-        self.cpu_temp = None
-        self.gpu_temp = None
-        self.temp_source = ""
+    def _nvidia_temp(self):
+        """GPU temperature from the NVIDIA driver's own library (nvml.dll), or None."""
+        if self._nvml is False:
+            return None  # already found there is no NVIDIA driver here
+        try:
+            if self._nvml is None:
+                lib = ctypes.WinDLL("nvml")
+                lib.nvmlDeviceGetHandleByIndex_v2.argtypes = (ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p))
+                lib.nvmlDeviceGetTemperature.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint))
+                handle = ctypes.c_void_p()
+                if lib.nvmlInit_v2() != 0 or lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)) != 0:
+                    raise OSError("NVML not usable")
+                self._nvml = (lib, handle)
+            lib, handle = self._nvml
+            temp = ctypes.c_uint()
+            if lib.nvmlDeviceGetTemperature(handle, 0, ctypes.byref(temp)) != 0:  # 0 = the GPU sensor
+                return None
+            return float(temp.value)
+        except Exception:
+            self._nvml = False
+            return None
 
     def _read_top_apps(self):
+        try:
+            procs = process_memory()
+        except Exception:
+            procs = self._process_memory_psutil()
         totals = {}
-        for p in psutil.process_iter(["name", "memory_info"]):
-            try:
-                name = p.info["name"] or "?"
-                mem = p.info["memory_info"].rss
-            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
-                continue
-            if name in ("System Idle Process", "Memory Compression"):
+        for name, mem in procs:
+            # psutil calls the memory compression process "MemCompression"
+            if name in ("System Idle Process", "Memory Compression", "MemCompression"):
                 continue
             t = totals.setdefault(name, [0, 0])
             t[0] += mem
@@ -231,10 +365,22 @@ class SlowData:
         ranked = sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True)[:3]
         self.top_apps = [(n, v[0], v[1]) for n, v in ranked]
 
+    @staticmethod
+    def _process_memory_psutil():
+        """Fallback if the fast path fails: slower, and counts shared memory once per process."""
+        result = []
+        for p in psutil.process_iter(["name", "memory_info"]):
+            try:
+                result.append((p.info["name"] or "?", p.info["memory_info"].rss))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+                continue
+        return result
+
 
 # ---------------------------------------------------------------- widget
 class Widget:
     def __init__(self):
+        enable_dpi_awareness()
         self.cfg = load_config()
         self.root = tk.Tk()
         self.root.title("PC Monitor")
@@ -242,8 +388,12 @@ class Widget:
         self.root.configure(bg=BG)
         self.root.attributes("-alpha", self.cfg["alpha"])
         self.root.attributes("-topmost", self.cfg["topmost"])
-        self.root.geometry(f"{WIDTH}x10+{self.cfg['x']}+{self.cfg['y']}")
+        # 1.0 at 100% display scaling, 1.25 at 125%... Fonts scale by themselves, pixel sizes do not.
+        self.scale = self.root.winfo_fpixels("1i") / 96
+        self.width = self._px(WIDTH)
+        self.root.geometry(f"{self.width}x10+{self.cfg['x']}+{self.cfg['y']}")
 
+        self.drive = os.environ.get("SystemDrive", "C:")
         self.slow = SlowData()
         self.last_net = psutil.net_io_counters()
         self.last_net_t = time.time()
@@ -251,16 +401,24 @@ class Widget:
 
         self._drag = (0, 0)
         self._build()
-        self._bind_all(self.root)
+        self._bind_events()
         self._make_menu()
         self.root.update_idletasks()
-        self.root.geometry(f"{WIDTH}x{self.root.winfo_reqheight()}+{self.cfg['x']}+{self.cfg['y']}")
+        height = self.root.winfo_reqheight()
+        if not on_screen(self.cfg["x"] + self.width // 2, self.cfg["y"] + height // 2):
+            self.cfg["x"], self.cfg["y"] = 40, 40  # saved on a screen that is gone: come back into view
+        self.root.geometry(f"{self.width}x{height}+{self.cfg['x']}+{self.cfg['y']}")
         self._tick()
+
+    def _px(self, n):
+        """Scale a pixel size to the display's scaling factor."""
+        return round(n * self.scale)
 
     # ---- UI construction
     def _build(self):
+        px = self._px
         pad = tk.Frame(self.root, bg=BG)
-        pad.pack(fill="both", expand=True, padx=12, pady=10)
+        pad.pack(fill="both", expand=True, padx=px(12), pady=px(10))
 
         # header: time + date
         head = tk.Frame(pad, bg=BG)
@@ -268,27 +426,27 @@ class Widget:
         self.clock = tk.Label(head, text="", bg=BG, fg=FG, font=("Segoe UI Semibold", 22))
         self.clock.pack(side="left")
         self.date = tk.Label(head, text="", bg=BG, fg=MUTED, font=("Segoe UI", 9), justify="right")
-        self.date.pack(side="right", pady=(8, 0))
+        self.date.pack(side="right", pady=(px(8), 0))
 
         self.cpu_val, self.cpu_bar = self._meter(pad, "CPU")
         self.ram_val, self.ram_bar = self._meter(pad, "RAM")
         self.ram_sub = tk.Label(pad, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8), anchor="w")
         self.ram_sub.pack(fill="x")
-        self.disk_val, self.disk_bar = self._meter(pad, "DISK C:")
+        self.disk_val, self.disk_bar = self._meter(pad, f"DISK {self.drive}")
 
         # temperature card
         tcard = tk.Frame(pad, bg=CARD)
-        tcard.pack(fill="x", pady=(8, 0))
+        tcard.pack(fill="x", pady=(px(8), 0))
         self.temp_cpu = tk.Label(tcard, text="CPU --", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 11))
-        self.temp_cpu.pack(side="left", padx=10, pady=6)
+        self.temp_cpu.pack(side="left", padx=px(10), pady=px(6))
         self.temp_gpu = tk.Label(tcard, text="", bg=CARD, fg=MUTED, font=("Segoe UI Semibold", 11))
-        self.temp_gpu.pack(side="left", padx=4)
+        self.temp_gpu.pack(side="left", padx=px(4))
         self.temp_note = tk.Label(tcard, text="", bg=CARD, fg=MUTED, font=("Segoe UI", 7))
-        self.temp_note.pack(side="right", padx=8)
+        self.temp_note.pack(side="right", padx=px(8))
 
         # top apps
         tk.Label(pad, text="TOP RAM APPS", bg=BG, fg=MUTED, font=("Segoe UI Semibold", 8),
-                 anchor="w").pack(fill="x", pady=(10, 2))
+                 anchor="w").pack(fill="x", pady=(px(10), px(2)))
         self.app_labels = []
         for _ in range(3):
             row = tk.Frame(pad, bg=BG)
@@ -300,8 +458,8 @@ class Widget:
             self.app_labels.append((n, v))
 
         # footer stats
-        sep = tk.Frame(pad, bg=CARD, height=1)
-        sep.pack(fill="x", pady=8)
+        sep = tk.Frame(pad, bg=CARD, height=max(1, px(1)))
+        sep.pack(fill="x", pady=px(8))
         self.net_lbl = tk.Label(pad, text="", bg=BG, fg=FG, font=("Segoe UI", 9), anchor="w")
         self.net_lbl.pack(fill="x")
         self.bat_lbl = tk.Label(pad, text="", bg=BG, fg=FG, font=("Segoe UI", 9), anchor="w")
@@ -311,30 +469,31 @@ class Widget:
 
     def _meter(self, parent, title):
         frame = tk.Frame(parent, bg=BG)
-        frame.pack(fill="x", pady=(8, 0))
+        frame.pack(fill="x", pady=(self._px(8), 0))
         top = tk.Frame(frame, bg=BG)
         top.pack(fill="x")
         tk.Label(top, text=title, bg=BG, fg=MUTED, font=("Segoe UI Semibold", 8)).pack(side="left")
         val = tk.Label(top, text="--", bg=BG, fg=FG, font=("Segoe UI Semibold", 10))
         val.pack(side="right")
-        bar = tk.Canvas(frame, height=6, bg=CARD, highlightthickness=0)
-        bar.pack(fill="x", pady=(2, 0))
+        bar = tk.Canvas(frame, height=self._px(6), bg=CARD, highlightthickness=0)
+        bar.pack(fill="x", pady=(self._px(2), 0))
         return val, bar
 
     def _set_bar(self, canvas, pct):
         canvas.update_idletasks()
         w = canvas.winfo_width()
         canvas.delete("all")
-        canvas.create_rectangle(0, 0, w * min(pct, 100) / 100, 6, fill=pct_color(pct), width=0)
+        canvas.create_rectangle(0, 0, w * min(pct, 100) / 100, canvas.winfo_height(),
+                                fill=pct_color(pct), width=0)
 
     # ---- interactions
-    def _bind_all(self, widget):
-        widget.bind("<Button-1>", self._start_drag)
-        widget.bind("<B1-Motion>", self._do_drag)
-        widget.bind("<ButtonRelease-1>", self._end_drag)
-        widget.bind("<Button-3>", self._popup)
-        for child in widget.winfo_children():
-            self._bind_all(child)
+    def _bind_events(self):
+        # Bind on the window only. Tk also runs a window's bindings for every widget inside it,
+        # so binding each child as well ran every handler twice per click (the menu opened twice).
+        self.root.bind("<Button-1>", self._start_drag)
+        self.root.bind("<B1-Motion>", self._do_drag)
+        self.root.bind("<ButtonRelease-1>", self._end_drag)
+        self.root.bind("<Button-3>", self._popup)
 
     def _start_drag(self, e):
         self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
@@ -345,11 +504,15 @@ class Widget:
         self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
     def _end_drag(self, _e):
-        self.cfg["x"], self.cfg["y"] = self.root.winfo_x(), self.root.winfo_y()
-        save_config(self.cfg)
+        pos = (self.root.winfo_x(), self.root.winfo_y())
+        if pos != (self.cfg["x"], self.cfg["y"]):  # a plain click does not need a file write
+            self.cfg["x"], self.cfg["y"] = pos
+            save_config(self.cfg)
 
     def _make_menu(self):
         self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label=f"PC Monitor Widget v{__version__}", state="disabled")
+        self.menu.add_separator()
         self.var_top = tk.BooleanVar(value=self.cfg["topmost"])
         self.var_lock = tk.BooleanVar(value=self.cfg["locked"])
         self.menu.add_checkbutton(label="Always on top", variable=self.var_top, command=self._toggle_top)
@@ -395,6 +558,13 @@ class Widget:
 
     # ---- refresh loop
     def _tick(self):
+        try:
+            self._refresh()
+        except Exception:
+            traceback.print_exc()  # one bad reading must not stop the widget updating for good
+        self.root.after(REFRESH_MS, self._tick)
+
+    def _refresh(self):
         now = datetime.now()
         self.clock.config(text=now.strftime("%I:%M %p").lstrip("0"))
         self.date.config(text=now.strftime("%A\n%d %b %Y"))
@@ -409,7 +579,7 @@ class Widget:
         self.ram_sub.config(text=f"{fmt_bytes(vm.used)} used of {fmt_bytes(vm.total)}  •  {fmt_bytes(vm.available)} free")
 
         try:
-            du = psutil.disk_usage(os.environ.get("SystemDrive", "C:") + "\\")
+            du = psutil.disk_usage(self.drive + "\\")
             self.disk_val.config(text=f"{du.percent:.0f}%  •  {fmt_bytes(du.free)} free", fg=pct_color(du.percent))
             self._set_bar(self.disk_bar, du.percent)
         except Exception:
@@ -419,14 +589,12 @@ class Widget:
         ct, gt = self.slow.cpu_temp, self.slow.gpu_temp
         if ct is not None:
             self.temp_cpu.config(text=f"CPU {ct:.0f}°C", fg=temp_color(ct))
-            self.temp_note.config(text=self.slow.temp_source)
+        elif gt is not None:
+            self.temp_cpu.config(text="CPU n/a", fg=MUTED)
         else:
             self.temp_cpu.config(text="Temp: N/A", fg=MUTED)
-            self.temp_note.config(text="start LibreHardwareMonitor")
-        if gt is not None:
-            self.temp_gpu.config(text=f"GPU {gt:.0f}°C", fg=temp_color(gt))
-        else:
-            self.temp_gpu.config(text="")
+        self.temp_gpu.config(text=f"GPU {gt:.0f}°C" if gt is not None else "", fg=temp_color(gt))
+        self.temp_note.config(text=self.slow.temp_source or "start LibreHardwareMonitor")
 
         # top apps
         apps = self.slow.top_apps
@@ -457,7 +625,12 @@ class Widget:
         except Exception:
             b = None
         if b is not None:
-            state = "charging" if b.power_plugged else "on battery"
+            if not b.power_plugged:
+                state = "on battery"
+            elif b.percent >= 100:
+                state = "plugged in"
+            else:
+                state = "charging"
             left = ""
             if not b.power_plugged and b.secsleft not in (None, psutil.POWER_TIME_UNLIMITED, psutil.POWER_TIME_UNKNOWN):
                 left = f"  •  {fmt_uptime(b.secsleft)} left"
@@ -466,8 +639,6 @@ class Widget:
             self.bat_lbl.config(text="Power: plugged in (no battery)")
 
         self.up_lbl.config(text=f"Uptime {fmt_uptime(time.time() - psutil.boot_time())}  •  {len(psutil.pids())} processes")
-
-        self.root.after(REFRESH_MS, self._tick)
 
     def run(self):
         self.root.mainloop()
