@@ -8,3 +8,7 @@ venv/
 build/
 dist/
 *.spec
+
+# Sensor helpers downloaded by get_vendor.ps1
+vendor/
+_dl/

@@ -26,8 +26,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Download sensor helpers (LibreHardwareMonitor + PawnIO driver)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./get_vendor.ps1
+
       - name: Build exe
-        run: pyinstaller --onefile --noconsole --name PCMonitorWidget --hidden-import wmi --hidden-import pythoncom --hidden-import win32com.client pc_widget.py
+        run: >
+          pyinstaller --onefile --noconsole --name PCMonitorWidget
+          --add-data "vendor;vendor"
+          --hidden-import wmi --hidden-import pythoncom --hidden-import win32com.client
+          pc_widget.py
 
       - name: Upload build as artifact
         uses: actions/upload-artifact@v4
