@@ -86,48 +86,6 @@ Do not type these commands inside the Python prompt (the one that shows `>>>`). 
 - Double-click `start_widget.vbs`. It starts the widget in the background with no console window. Keep it in the same folder as `pc_widget.py`.
 - Or run `pythonw pc_widget.py` from Command Prompt.
 
-## Build the exe yourself
-
-### Option A: on your PC
-
-1. Install Python (see above) and the [GitHub CLI](https://cli.github.com), then run `gh auth login` once.
-2. Double-click `build.bat`, or run it from Command Prompt. It downloads the sensor helpers, then builds.
-3. The result is `dist\PCMonitorWidget.exe`, with everything bundled inside.
-
-### Option B: automatically on GitHub (for maintainers)
-
-The repository contains a GitHub Actions workflow (`.github/workflows/build.yml`) that builds the exe on a Windows machine and attaches it to a release.
-
-1. Push the code to GitHub.
-2. Create and push a version tag:
-
-   ```
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
-
-3. Wait a few minutes. The exe appears under **Releases** for that tag.
-
-You can also run the workflow manually from the **Actions** tab (Build Windows exe, then Run workflow) and download the exe from the run's artifacts.
-
-## Uploading to GitHub (first time)
-
-1. Create a free account at github.com and click **New repository**. Name it `pc-monitor-widget`, leave it empty (no README), and create it.
-2. Install Git for Windows, then in the project folder run:
-
-   ```
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/pc-monitor-widget.git
-   git push -u origin main
-   ```
-
-3. Follow Option B above to publish the exe.
-
-Before publishing, open `LICENSE` and replace `Your Name` with your name, and add a screenshot to `docs/screenshot.png` (then enable the image line near the top of this file).
-
 ## Troubleshooting
 
 **Temp: N/A** — See [How temperature works](#how-temperature-works). Most often: click Yes on the permission prompt and wait a few seconds after the first start.
