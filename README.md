@@ -106,6 +106,40 @@ Do not type these commands inside the Python prompt (the one that shows `>>>`). 
 
 **It shows only one monitor's worth of position after I unplug a screen** — Delete `.pc_widget.json` in your user folder to reset its position.
 
+
+# uninstall PC-monitor-widget
+Do these in order. The first step matters most, because it stops the widget from starting again.
+
+## 1. Turn off auto-start and close the widget
+1. Right-click the widget and **untick Start with Windows**.
+2. Right-click it again and choose **Close widget**. This also closes the hidden LibreHardwareMonitor it started.
+
+If you can't reach the menu, press **Ctrl+Shift+Esc** to open Task Manager. End `PCMonitorWidget` and `LibreHardwareMonitor` on the **Details** tab.
+
+## 2. Make sure the startup task is gone
+1. Press the Windows key, type **Task Scheduler**, and open it.
+2. Click **Task Scheduler Library** on the left.
+3. If you see **PCMonitorWidget** in the list, right-click it and choose **Delete**.
+
+## 3. Delete the widget's files
+1. Delete `PCMonitorWidget.exe` from wherever you saved it, such as Downloads.
+2. Press **Win+R**, type `%LOCALAPPDATA%`, press Enter, and delete the **PCMonitorWidget** folder. This holds the bundled sensor program.
+3. Press **Win+R**, type `%USERPROFILE%`, press Enter, and delete `.pc_widget.json`. This is your saved position and settings. It's a hidden file, so tick **View → Hidden items** if you can't see it.
+
+## 4. Remove the sensor driver (PawnIO)
+The widget installed this driver on first run, and it stays on the PC unless you remove it.
+1. Open **Settings → Apps → Installed apps**.
+2. Search for **PawnIO**, click the three dots, and choose **Uninstall**.
+
+If PawnIO isn't in the list, open Command Prompt as administrator and run `winget uninstall PawnIO`.
+
+## 5. Only if you ran it from Python source
+- Press **Win+R**, type `shell:startup`, and delete any widget shortcut there (the one for `start_widget.vbs`).
+- Delete the project folder.
+- Optionally run `pip uninstall psutil wmi pywin32` in Command Prompt. Skip this if you use those packages for anything else.
+
+After a restart, the widget should be completely gone. If it reappears, check Task Manager's **Startup apps** tab and the Task Scheduler step again.
+
 ## Project layout
 
 ```
