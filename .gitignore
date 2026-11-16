@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller output (build.bat)
+build/
+dist/
+*.spec
+
+# Sensor helpers downloaded by get_vendor.ps1
+vendor/
+_dl/

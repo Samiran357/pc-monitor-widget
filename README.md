@@ -2,16 +2,14 @@
 
 A small, always-visible desktop widget for Windows 10/11 that shows live system stats: CPU, RAM, temperature, the apps using the most memory, and more. It is draggable, semi-transparent, and uses very little CPU itself.
 
-<!-- Add a screenshot here after you upload it to the repo:
 ![Screenshot](docs/screenshot.png)
--->
 
 ## Features
 
 - Clock and date
 - CPU usage and RAM usage, with colour bars (green, yellow, red) and used/free memory
 - CPU and GPU temperature
-- Top 3 apps by RAM (all processes of one app are added together, e.g. `chrome x24`)
+- Top 3 apps by RAM (all processes of one app are added together, e.g. `chrome x24`), using the same memory figure as Task Manager
 - Disk usage of the system drive
 - Live download and upload speed
 - Battery level and time left (or "plugged in" on desktops)
@@ -32,7 +30,7 @@ That's it. Python, LibreHardwareMonitor and the sensor driver are all included i
 
 ### Why administrator?
 
-Windows only lets programs with administrator rights read hardware temperatures. The widget asks once when it opens. If you click **No**, it still works but shows `Temp: N/A`.
+Windows only lets programs with administrator rights read hardware temperatures. The widget asks once when it opens. If you click **No**, it still works; temperature then comes from the simpler Windows sensors described below, or shows `Temp: N/A` if your PC has none.
 
 > **Windows SmartScreen or antivirus warning?** Programs built with PyInstaller are sometimes flagged because they are new and unsigned. The full source is in this repository, and you can build the exe yourself (see [Build the exe yourself](#build-the-exe-yourself)) if you prefer.
 
@@ -49,6 +47,8 @@ Nothing to download or start by hand. If you ever see `Temp: N/A`:
 - A few PCs (some laptops, virtual machines) simply don't expose a temperature sensor. Everything else in the widget still works.
 - Some antivirus programs dislike hardware-monitoring drivers. If yours blocks it, allow the widget in your antivirus.
 
+When the helpers are not available (permission declined, running from source without the `vendor` folder, or a PC where they cannot run), the widget falls back to sensors Windows exposes to normal programs: the ACPI thermal zone for the CPU (most laptops have one; the note shows `ACPI`) and the NVIDIA driver for the GPU (note shows `NVIDIA`). These need no helper and no administrator rights, but LibreHardwareMonitor's readings are more accurate, so it is used whenever it is running.
+
 ## Controls
 
 | Action | How |
@@ -60,6 +60,7 @@ Nothing to download or start by hand. If you ever see `Temp: N/A`:
 | Change transparency | Menu, Opacity |
 | Start with Windows | Menu, Start with Windows |
 | Close | Menu, Close widget |
+| See which version you have | Right-click: the first line of the menu shows it |
 
 Settings are saved to `.pc_widget.json` in your user folder (`C:\Users\<you>\`). Delete that file to reset them.
 
@@ -88,11 +89,13 @@ Do not type these commands inside the Python prompt (the one that shows `>>>`). 
 
 ## Troubleshooting
 
-**Temp: N/A** — See [How temperature works](#how-temperature-works). Most often: click Yes on the permission prompt and wait a few seconds after the first start.
+**Temp: N/A** — See [How temperature works](#how-temperature-works). Most often: click Yes on the permission prompt and wait a few seconds after the first start. If it stays, your PC exposes no thermal zone to Windows and has no NVIDIA GPU either.
 
 **GitHub build fails at "Download sensor helpers"** — The release file names of LibreHardwareMonitor or PawnIO may have changed. Open the failed step's log: it prints the available file names. Adjust the names in `get_vendor.ps1`.
 
 **Nothing happens when I run it** — Run `python pc_widget.py` from Command Prompt (not `pythonw`) to see any error message.
+
+**Windows says "An Application Control policy has blocked this file"** — Smart App Control (Windows 11) blocks programs that are not signed by a known publisher, and this exe is not signed. Run the widget from source instead (see [Run from source](#run-from-source)); Python itself is signed, so it is allowed. Smart App Control can be turned off in Windows Security, but it cannot be turned on again without reinstalling Windows.
 
 **`pip` is not recognized** — Use `py -m pip ...`, or add Python to PATH by rerunning the Python installer, choosing Modify, and ticking "Add Python to environment variables".
 
@@ -104,7 +107,7 @@ Do not type these commands inside the Python prompt (the one that shows `>>>`). 
 
 **How do I stop it from starting with Windows?** — Right-click the widget and untick Start with Windows. You can also check Task Manager, Startup tab.
 
-**It shows only one monitor's worth of position after I unplug a screen** — Delete `.pc_widget.json` in your user folder to reset its position.
+**The widget disappeared after I unplugged a screen** — Start it again (end `PCMonitorWidget` in Task Manager first if it is still running). If its saved position is no longer on any screen, it moves back to the top-left of the main screen.
 
 
 # uninstall PC-monitor-widget
@@ -151,6 +154,7 @@ pc-monitor-widget/
 ├── get_vendor.ps1            Downloads LibreHardwareMonitor + PawnIO for bundling
 ├── THIRD_PARTY.md            Licenses of the bundled helpers
 ├── .github/workflows/build.yml   Builds and releases the exe on GitHub
+├── docs/screenshot.png       Screenshot used in this file
 ├── LICENSE
 └── README.md
 ```
